@@ -1,13 +1,21 @@
-# Byte-compiled / optimized / DLL files
+# Dumps
+dump/
+*.json
+!package.json
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Virtual environments
+*.so
+.Python
 venv/
-.venv/
-env/
-.env
+ENV/
 
 # IDE
 .idea/
@@ -19,17 +27,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# Scan outputs
-supabase_dump_*/
-supabase_report_*.txt
-*.json
-!requirements.json
-
 # Logs
 *.log
-
-# Credentials
-.env
-.env.*
-*.key
-*.pem

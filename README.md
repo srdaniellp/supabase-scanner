@@ -1,34 +1,68 @@
-# Supabase Scanner
+# Supabase RLS Scanner v2.0
 
-A security assessment tool for analyzing Row Level Security (RLS) configurations in Supabase instances.
-
-```
-  ____                   _                    ____
- / ___| _   _ _ __   __ _| |__   __ _ ___  ___/ ___|  ___ __ _ _ __  _ __   ___ _ __
- \___ \| | | | '_ \ / _` | '_ \ / _` / __|/ _ \___ \ / __/ _` | '_ \| '_ \ / _ \ '__|
-  ___) | |_| | |_) | (_| | |_) | (_| \__ \  __/___) | (_| (_| | | | | | | |  __/ |
- |____/ \__,_| .__/ \__,_|_.__/ \__,_|___/\___|____/ \___\__,_|_| |_|_| |_|\___|_|
-             |_|
-```
+Security scanner for detecting Row Level Security (RLS) misconfigurations in Supabase instances.
 
 ## Features
 
-- **Automatic Credential Discovery**: Extracts Supabase URL and Anon Key from websites and GitHub repositories
-- **Table Enumeration**: Discovers accessible tables through the PostgREST API
-- **RLS Status Detection**: Identifies disabled, partial, or properly configured RLS
-- **Write Access Testing**: Tests for INSERT/UPDATE/DELETE permissions
-- **Storage Bucket Analysis**: Lists storage buckets and their visibility settings
-- **RPC Function Discovery**: Enumerates accessible RPC functions
-- **Data Export**: Dumps exposed data to JSON and CSV formats
-- **Detailed Reports**: Generates comprehensive security assessment reports
+- **Automatic credential discovery** from websites, GitHub repositories, and project references
+- **RLS vulnerability detection** - identifies disabled or partially configured RLS
+- **Write access testing** - tests INSERT/UPDATE/DELETE permissions
+- **Storage bucket enumeration** - discovers public and private buckets
+- **RPC function discovery** - finds exposed RPC endpoints
+- **Service role escalation** - hunts for service_role keys and performs full database dump
+- **Comprehensive reporting** - generates detailed JSON and text reports
 
 ## Installation
 
 ```bash
+# Clone the repository
 git clone https://github.com/srdaniellp/supabase-scanner.git
 cd supabase-scanner
-pip install -r requirements.txt
+
+# Install dependencies
+pip install requests
 ```
+
+## GitHub Token Configuration
+
+The scanner uses GitHub API to search for Supabase credentials in repositories. Without a token, you're limited to 10 requests per minute. With a token, you get 30 requests per minute.
+
+### Creating a GitHub Token
+
+1. Go to [GitHub Settings > Developer Settings > Personal Access Tokens](https://github.com/settings/tokens)
+2. Click "Generate new token (classic)"
+3. Give it a name (e.g., "supabase-scanner")
+4. Select scope: `public_repo` (only needed for public repository access)
+5. Click "Generate token"
+6. Copy the token
+
+### Setting the Token
+
+**Linux/macOS:**
+```bash
+export GITHUB_TOKEN=ghp_your_token_here
+python supabase_scanner.py
+```
+
+**Windows (PowerShell):**
+```powershell
+$env:GITHUB_TOKEN = "ghp_your_token_here"
+python supabase_scanner.py
+```
+
+**Windows (CMD):**
+```cmd
+set GITHUB_TOKEN=ghp_your_token_here
+python supabase_scanner.py
+```
+
+**Permanent (add to shell profile):**
+```bash
+# Add to ~/.bashrc or ~/.zshrc
+export GITHUB_TOKEN=ghp_your_token_here
+```
+
+> **Note:** The scanner works without a token but with reduced rate limits. For scanning multiple targets, a token is recommended.
 
 ## Usage
 
@@ -36,79 +70,101 @@ pip install -r requirements.txt
 python supabase_scanner.py
 ```
 
-### Input Options
+### Input Types
 
-The scanner accepts three types of input:
+The scanner accepts multiple input formats:
 
-1. **Website URL**: `https://example.com` - Automatically extracts Supabase credentials from the site
-2. **Direct Supabase URL**: `https://abc123.supabase.co` - Uses the provided project URL
-3. **Project Reference**: `abc123xyz` - Builds the URL automatically
+1. **Website URL**: `https://example.com` - extracts credentials from source code
+2. **Supabase URL**: `https://abc123.supabase.co` - searches GitHub for anon key
+3. **Project Reference**: `abc123xyz` - constructs URL and searches for key
+4. **GitHub Repository**: `user/repo` - extracts credentials directly
 
-### Environment Variables
-
-For better GitHub search results (higher rate limits), set your GitHub token:
-
-```bash
-export GITHUB_TOKEN=your_github_token
-```
-
-## Output
-
-### Console Report
-
-The scanner provides a detailed console report including:
-- RLS status (disabled/partial/enabled)
-- List of exposed tables with row counts
-- Write access status
-- Storage buckets visibility
-- Available RPC functions
-
-### File Output
-
-- `supabase_report_<project>_<timestamp>.txt` - Text report
-- `supabase_dump_<project>_<timestamp>/` - Directory with:
-  - `<table>.json` - JSON dump of each table
-  - `<table>.csv` - CSV dump of each table
-  - `SUMMARY.json` - Scan summary
-
-## Example
+### Example Session
 
 ```
-$ python supabase_scanner.py
-
 Target: https://example.com
 
-[*] Step 1: Analyzing website source code...
+[*] Phase 1: Analyzing website source code...
 [+] Supabase URL extracted: https://abc123.supabase.co
-[+] Anon key extracted from site!
+[+] Anon key extracted from website!
 
-[*] Starting analysis...
+============================================================
+STARTING ANALYSIS
+============================================================
+
 [+] Connection OK (Status: 200)
 [*] Enumerating tables...
 [FOUND] TABLE: users (1523 rows)
 [FOUND] TABLE: profiles (1520 rows)
+[FOUND] TABLE: orders (8942 rows)
+
 [*] Testing write access...
-[+] No write access detected
+[CRITICAL] INSERT allowed on 'users'!
+[CRITICAL] DELETE allowed on 'users'!
 
-======================================================================
-SUPABASE ANALYSIS REPORT
-======================================================================
-
-Target: https://abc123.supabase.co
-Date: 2024-01-15 14:30:00
-
-[WARNING] RLS PARTIALLY CONFIGURED
-Some tables are exposed
-
-EXPOSED TABLES (2)
->> users (1523 records)
-   Columns: id, email, created_at...
+[*] Checking storage buckets...
+[FOUND] Found 3 buckets
+      - avatars: PUBLIC
+      - documents: private
+      - uploads: PUBLIC
 ```
+
+## Output
+
+### Dump Structure
+
+```
+dump/
+└── project_0629_1430/
+    ├── SUMMARY.json
+    ├── REPORT.txt
+    ├── users.json
+    ├── users.csv
+    ├── profiles.json
+    ├── profiles.csv
+    └── tables/           # (if service_role escalation)
+        ├── table1.json
+        ├── table2.json
+        └── ...
+```
+
+### Escalation Data (service_role)
+
+When a service_role key is found:
+
+```
+dump/
+└── project_0629_1430/
+    ├── auth_users.json        # All auth.users data
+    ├── all_tables.txt         # List of all tables
+    ├── auth_settings.json     # Auth configuration
+    ├── storage_objects.json   # All storage objects
+    ├── SERVICE_ROLE_KEY.txt   # The service_role key
+    └── tables/                # Full dump of ALL tables
+```
+
+## RLS Status Levels
+
+| Status | Description |
+|--------|-------------|
+| `enabled` | No tables accessible - RLS properly configured |
+| `partial` | Some tables exposed but no write access |
+| `disabled` | Full read/write access - critical vulnerability |
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `GITHUB_TOKEN` | GitHub personal access token for API requests (optional, improves rate limits) |
 
 ## Disclaimer
 
-This tool is intended for authorized security testing and educational purposes only. Always obtain proper authorization before testing any systems you do not own. The authors are not responsible for any misuse or damage caused by this tool.
+This tool is intended for authorized security testing only. Always obtain proper authorization before scanning any Supabase instance. Unauthorized access to computer systems is illegal.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License

