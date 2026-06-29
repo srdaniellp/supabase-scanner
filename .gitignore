@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scan outputs
+supabase_dump_*/
+supabase_report_*.txt
+*.json
+!requirements.json
+
+# Logs
+*.log
+
+# Credentials
+.env
+.env.*
+*.key
+*.pem
