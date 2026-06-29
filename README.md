@@ -25,7 +25,7 @@ A security assessment tool for analyzing Row Level Security (RLS) configurations
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/supabase-scanner.git
+git clone https://github.com/srdaniellp/supabase-scanner.git
 cd supabase-scanner
 pip install -r requirements.txt
 ```
